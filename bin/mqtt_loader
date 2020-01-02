@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+import asyncio
+import dataclasses
+import datetime
+import json
+import signal
+import socket
+from typing import List, Optional
+
+import asyncpg
+import paho.mqtt.client as mqtt
+
+
+class MQTTClient:
+    """
+    A simple asyncio wrapper around the paho MQTT client.
+    """
+
+    def __init__(
+        self, *, host: str, port: int = 1883, timeout: int = 60, topics: List[str]
+    ) -> None:
+
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.topics = topics
+
+        self.loop = asyncio.get_running_loop()
+
+        self.client = mqtt.Client()
+        self.client.on_socket_open = self._on_socket_open
+        self.client.on_socket_close = self._on_socket_close
+        self.client.on_socket_register_write = self._on_socket_register_write
+        self.client.on_socket_unregister_write = self._on_socket_unregister_write
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+
+        self._misc_task: Optional[asyncio.Task] = None
+
+        self.queue = asyncio.Queue()
+        self.connected = asyncio.Event()
+        self.disconnected = asyncio.Event()
+        self.disconnected.set()
+
+    ##################
+    # MQTT callbacks #
+    ##################
+
+    def _on_socket_open(self, client, userdata, sock):
+        self.loop.add_reader(sock, lambda: client.loop_read())
+        self._misc_task = self.loop.create_task(self._misc_loop())
+
+    def _on_socket_close(self, client, userdata, sock):
+        self.loop.remove_reader(sock)
+        self._misc_task.cancel()
+
+    def _on_socket_register_write(self, client, userdata, sock):
+        self.loop.add_writer(sock, lambda: client.loop_write())
+
+    def _on_socket_unregister_write(self, client, userdata, sock):
+        self.loop.remove_writer(sock)
+
+    def _on_connect(self, client, userdata, flags, rc):
+        self.connected.set()
+        self.disconnected.clear()
+
+    def _on_message(self, client, userdata, msg):
+        self.queue.put_nowait(msg)
+
+    def _on_disconnect(self, client, userdata, rc):
+        self.connected.clear()
+        self.disconnected.set()
+
+    #############
+    # Misc loop #
+    #############
+
+    async def _misc_loop(self) -> None:
+        """
+        Task that calles client.loop_misc() every second.
+        This handles reconnects and pings.
+        """
+
+        while self.client.loop_misc() == mqtt.MQTT_ERR_SUCCESS:
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+
+    ##############
+    # Public API #
+    ##############
+
+    async def connect(self) -> None:
+        assert not self.connected.is_set()
+        assert self._misc_task is None
+
+        self.client.connect(self.host, self.port, self.timeout)
+        self.client.socket().setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+        await self.connected.wait()
+        for topic in self.topics:
+            self.client.subscribe(topic)
+
+    async def disconnect(self) -> None:
+        assert self.connected.is_set()
+        assert self._misc_task is not None
+
+        self.client.disconnect()
+        await self.disconnected.wait()
+        await self._misc_task
+
+    ###################
+    # Context manager #
+    ###################
+
+    async def __aenter__(self):
+        if self.disconnected.is_set():
+            await self.connect()
+
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.connected.is_set():
+            await self.disconnect()
+
+    ############
+    # Iterable #
+    ############
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.queue.get()
+
+
+@dataclasses.dataclass
+class SensorReading:
+    """
+    A single reading from a device.
+    """
+
+    device: str
+    timestamp: datetime.datetime
+    kind: str
+    value: Optional[float]
+
+
+async def insert_readings(*, queue: asyncio.Queue) -> None:
+    """
+    Insert readings into a PostgreSQL database.
+    """
+
+    conn = await asyncpg.connect()
+    try:
+        get_or_create_device = await conn.prepare(
+            """
+            insert into device (name, description) values ($1, '')
+            on conflict (name) do update set name=EXCLUDED.name
+            returning id
+            """
+        )
+        insert_temperature_statement = await conn.prepare(
+            """
+            insert into sensor_reading
+            (device_id, timestamp, temperature)
+            values ($1, $2, $3)
+            on conflict (device_id, timestamp)
+            do update set temperature = EXCLUDED.temperature
+            """
+        )
+        insert_relative_humidity_statement = await conn.prepare(
+            """
+            insert into sensor_reading
+            (device_id, timestamp, relative_humidity)
+            values ($1, $2, $3)
+            on conflict (device_id, timestamp)
+            do update set relative_humidity = EXCLUDED.relative_humidity
+            """
+        )
+        while True:
+            reading = await queue.get()
+            device_id = await get_or_create_device.fetchval(reading.device)
+            if reading.kind == "temperature":
+                await insert_temperature_statement.fetch(
+                    device_id, reading.timestamp, reading.value,
+                )
+            elif reading.kind == "relative-humidity":
+                await insert_relative_humidity_statement.fetch(
+                    device_id, reading.timestamp, reading.value,
+                )
+            else:
+                print(f"Unknown reading type: {reading}")
+            queue.task_done()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await conn.close()
+
+
+async def handle_messages(*, queue: asyncio.Queue) -> None:
+    """
+    Read and parse messages from MQTT.
+    """
+
+    try:
+        async with MQTTClient(host="192.168.86.3", topics=["devices/+/+"]) as client:
+            async for message in client:
+                _, device, reading_kind = message.topic.split("/", 2)
+                data = json.loads(message.payload)
+                await queue.put(
+                    SensorReading(
+                        device=device,
+                        timestamp=datetime.datetime.strptime(
+                            data["timestamp"], "%Y-%m-%dT%H:%M:%S%z"
+                        ),
+                        kind=reading_kind,
+                        value=data[reading_kind.replace("-", "_")],
+                    )
+                )
+    except asyncio.CancelledError:
+        pass
+
+
+async def main() -> None:
+    """
+    Main method.
+    """
+
+    loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+
+    receive_task = asyncio.create_task(handle_messages(queue=queue))
+    insert_task = asyncio.create_task(insert_readings(queue=queue))
+
+    async def shutdown():
+        """
+        Shutdown routine. First cancel the receiver task, wait for the queue to
+        drain, and then cancel the insert task.
+        """
+
+        receive_task.cancel()
+        await queue.join()
+        insert_task.cancel()
+
+    def signal_handler():
+        """Signal handler that schedules a shutdown"""
+
+        loop.create_task(shutdown())
+
+    # Register a signal handler for the SIGINT (ctrl+c) signal
+    loop.add_signal_handler(signal.SIGINT, signal_handler)
+
+    # Wait for either all tasks to finish gracefully or for any task to fail
+    _, pending_tasks = await asyncio.wait(
+        [receive_task, insert_task], return_when=asyncio.FIRST_EXCEPTION
+    )
+
+    # If we got any pending tasks that means that one of the tasks failed. In
+    # that case we cancel any remaining tasks and wait for them to stop.
+    if pending_tasks:
+        for pending_task in pending_tasks:
+            pending_task.cancel()
+        await asyncio.wait([receive_task, insert_task])
+
+    # If any of the tasks failed, print the excpetion
+    if (receive_task_exception := receive_task.exception()) is not None:
+        print(f"Receive task failed:\n    {repr(receive_task_exception)}")
+
+    if (insert_task_exception := insert_task.exception()) is not None:
+        print(f"Receive task failed:\n    {repr(insert_task_exception)}")
+
+
+asyncio.run(main())

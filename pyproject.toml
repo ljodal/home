@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "home"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+triopg = "^0.3.0"
+paho-mqtt = "^1.5.0"
+
+[tool.poetry.dev-dependencies]
+isort = "^4.3.21"
+black = "^19.10b0"
+flake8 = "^3.7.9"
+pylint = "^2.4.4"
+ipython = "^7.11.0"
+
+[build-system]
+requires = ["poetry>=0.12"]
+build-backend = "poetry.masonry.api"

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+Apply any migrations currently not applied to the database.
+"""
+
+import argparse
+import asyncio
+import pathlib
+import re
+from typing import List, Tuple
+
+import asyncpg
+
+MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
+
+
+async def get_applied_migrations(connection: asyncpg.Connection) -> List[str]:
+    """
+    Get a list of all the migrations that have been applied to the database.
+    """
+
+    async with connection.transaction():
+        await connection.execute(
+            "create table if not exists migrations "
+            "( name varchar, applied_at timestamptz )"
+        )
+
+        return [
+            row["name"] for row in await connection.fetch("select name from migrations")
+        ]
+
+
+async def get_migration_plan(
+    connection: asyncpg.Connection,
+) -> List[Tuple[str, pathlib.Path]]:
+    """
+    Get a list of the migrations to apply, and the order to apply them in.
+    """
+
+    migration_files = sorted(
+        (path.stem, path)
+        for path in MIGRATIONS_DIR.iterdir()
+        if path.suffix == ".sql" and re.match(r"\d{4}_[\w_]+", path.stem)
+    )
+
+    applied_migrations = await get_applied_migrations(connection)
+
+    # Filter out any migrations that have already been applied
+    return [
+        (name, path) for name, path in migration_files if name not in applied_migrations
+    ]
+
+
+async def apply_migration(
+    *, name: str, path: pathlib.Path, connection: asyncpg.Connection
+) -> None:
+    """
+    Apply the given migration to the database.
+    """
+
+    with open(path, "r") as _f:
+        sql = _f.read()
+
+    async with connection.transaction():
+        await connection.execute(sql)
+        await connection.execute(
+            "insert into migrations (name, applied_at) values($1, now())", name
+        )
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Apply any migrations not currently applied to the database"
+    )
+    parser.add_argument("--host", help="PostgreSQL host to connect to")
+    parser.add_argument("-p", "--port", type=int, help="PostgreSQL port to connect to")
+    parser.add_argument("-U", "--user", help="PostgreSQL username to use")
+    parser.add_argument("-d", "--database", help="PostgeSQL database to connect to")
+    args = parser.parse_args()
+
+    connection = await asyncpg.connect(
+        host=args.host, port=args.port, user=args.user, database=args.database
+    )
+    try:
+        migration_plan = await get_migration_plan(connection)
+        for name, path in migration_plan:
+            await apply_migration(name=name, path=path, connection=connection)
+    finally:
+        await connection.close()
+
+
+asyncio.run(main())
