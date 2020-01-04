@@ -154,18 +154,11 @@ async def insert_readings(*, queue: asyncio.Queue) -> None:
 
     conn = await asyncpg.connect()
     try:
-        get_or_create_device = await conn.prepare(
-            """
-            insert into device (name, description) values ($1, '')
-            on conflict (name) do update set name=EXCLUDED.name
-            returning id
-            """
-        )
         insert_temperature_statement = await conn.prepare(
             """
             insert into sensor_reading
             (device_id, timestamp, temperature)
-            values ($1, $2, $3)
+            values (get_or_create_device($1), $2, $3)
             on conflict (device_id, timestamp)
             do update set temperature = EXCLUDED.temperature
             """
@@ -174,21 +167,20 @@ async def insert_readings(*, queue: asyncio.Queue) -> None:
             """
             insert into sensor_reading
             (device_id, timestamp, relative_humidity)
-            values ($1, $2, $3)
+            values (get_or_create_device($1), $2, $3)
             on conflict (device_id, timestamp)
             do update set relative_humidity = EXCLUDED.relative_humidity
             """
         )
         while True:
             reading = await queue.get()
-            device_id = await get_or_create_device.fetchval(reading.device)
             if reading.kind == "temperature":
                 await insert_temperature_statement.fetch(
-                    device_id, reading.timestamp, reading.value,
+                    reading.device, reading.timestamp, reading.value,
                 )
             elif reading.kind == "relative-humidity":
                 await insert_relative_humidity_statement.fetch(
-                    device_id, reading.timestamp, reading.value,
+                    reading.device, reading.timestamp, reading.value,
                 )
             else:
                 print(f"Unknown reading type: {reading}")
